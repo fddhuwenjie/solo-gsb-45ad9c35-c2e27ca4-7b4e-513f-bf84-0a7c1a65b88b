@@ -31,9 +31,10 @@
 接口只校验惩罚非负，取值可以任意大（如 1e20）：此时合法的最优分值本身
 可能是绝对值极大的负数（如 -1e20）。不可达哨兵必须严格小于任何可达
 分值，故使用真正的负无穷（不可达状态参与 max/加减时自然被淘汰，且不会
-被四舍五入进导出 JSON）；最优性比较使用随分值尺度缩放的容差，避免把
-“绝对值极大的合法负分”误判为不可达，也避免在大分值上按固定 1e-5 做
-等同比较时漏判本应并列的方案。
+被四舍五入进导出 JSON）；最优性比较使用尺度感知的 ULP 容差（同一分值
+经正/反表独立递推只相差数个浮点 ULP，给固定 ULP 余量），而不是按分值
+成比例放大的相对容差——相对容差在 2e20 量级会放大到 2e11，足以把
+相差 1e10（匹配中层需多开一次间隙）的次优归属误判为并列。
 """
 import math
 
@@ -42,19 +43,30 @@ from .domain import (
 )
 
 NEG = float("-inf")
-# 并列判定容差：固定绝对容差兜底小分值下的浮点舍入，相对容差覆盖大尺度
-# （1e20 量级时固定容差已无意义，该量级 ULP 约 1.6e4，故相对容差取 1e-9）。
+# 并列判定容差：
+# * 绝对容差 1e-7 兜底 0 附近（open/extend=0 时整段分值恒为 0）的舍入；
+# * 大尺度改用 ULP（2^52 精度下 1e20 量级一个 ULP 约 1.6e4）：同一数值经
+#   正表、反表、间隙区小表独立递推，舍入差只有数个 ULP，给 4096 ULP 余量
+#   已远宽于实际舍入，又远小于“多开一次间隙”造成的 1e10 级真实分差，
+#   不会把 -1.9999999999e20（端层最优）与 -2e20（中层次优）判为并列。
 TOL_ABS = 1e-7
-TOL_REL = 1e-9
+TOL_ULP = 4096
 MAX_SOLUTIONS = 100
 COUNT_CAP = 9999          # 并列解计数封顶，避免大整数
 
 
-def close(a, b, atol=TOL_ABS, rtol=TOL_REL):
-    """尺度感知的近似相等：不可达（-inf）只与 -inf 相等。"""
+def close(a, b, atol=TOL_ABS, ulps=TOL_ULP):
+    """尺度感知的近似相等：绝对容差兜底小分值，大分值按浮点 ULP 计。
+
+    不可达（-inf）只与 -inf 相等。ULP 容差随“较大绝对值”一侧的浮点
+    间距缩放（0 的 ULP 取 0.0：此尺度由 atol 覆盖），故不会像相对容差
+    那样在 1e20 量级把窗口放大到 1e11。
+    """
     if math.isinf(a) or math.isinf(b):
         return a == b
-    return abs(a - b) <= atol + rtol * max(abs(a), abs(b))
+    scale = max(abs(a), abs(b))
+    ulp_tol = ulps * math.ulp(scale) if scale > 0.0 else 0.0
+    return abs(a - b) <= atol + ulp_tol
 
 
 def elevation_layer(layer, collar_elev):
@@ -152,7 +164,7 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
     # 游程数最少）；不可达为 -inf，不可选到 x=0 的 H 或 y=0 的 V。
     h_ok, v_ok = math.isfinite(lH[x][y]), math.isfinite(lV[x][y])
     assert h_ok or v_ok, "间隙区终点不可达（不应出现：调用方只回溯最优区）"
-    state = "H" if h_ok and (not v_ok or lH[x][y] >= lV[x][y] - TOL_ABS) else "V"
+    state = "H" if h_ok and (not v_ok or close(lH[x][y], lV[x][y])) else "V"
     while x > 0 or y > 0:
         if state == "H":
             cont = lH[x-1][y] - gap_extend

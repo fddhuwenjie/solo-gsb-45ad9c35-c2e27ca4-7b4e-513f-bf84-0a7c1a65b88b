@@ -26,10 +26,11 @@ python wsgi.py          # http://localhost:8000
 
 核心算法（`app/correlator.py`）不依赖 Flask，可直接运行回归测试
 （含“全零参数下单层对单层只计 2 个并列解”、“低开间隙惩罚 `gap_open=0`、
-`gap_extend=1` 下 2×2 应得 6 个归属、不漏全部未匹配”与“极大开间隙惩罚
-`gap_open=1e20` 下合法负分 `-1e20` 不被当作不可达、2×1 应得 2 个归属”
-三类反例，以及多标志层分段锚点组合用例；另含一个端到端 HTTP 用例，
-无 Flask 时自动跳过）：
+`gap_extend=1` 下 2×2 应得 6 个归属、不漏全部未匹配”、“极大开间隙惩罚
+`gap_open=1e20` 下合法负分 `-1e20` 不被当作不可达、2×1 应得 2 个归属”与
+“大数值 `gap_open=1e20`、`gap_extend=9.999999999e19` 下 3×1 只算首/末层
+两个归属、中层不伪并列”四类反例，以及大数值真并列保留、容差边界和多
+标志层分段锚点组合用例；另含两个端到端 HTTP 用例，无 Flask 时自动跳过）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -77,6 +78,60 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
 # 「导出 JSON」(GET /api/export) 的 last_result 与重算结果口径一致。
 ```
 
+### 复现“大数值间隙费用下的伪并列”反例
+
+`PUT /api/settings` 允许任意**非负** `gap_open` / `gap_extend`，取值可以
+任意大。当五项相似度权重全为 0、参考孔**三层**、待校核孔**一层**、不锁
+标志层，并设 `gap_open=1e20`、`gap_extend=9.999999999e19` 时：待校核层
+匹配参考孔**首层或末层**都只开一个间隙游程（代价
+`-(open+extend)=-1.9999999999e20`），是真正的并列最优；而匹配**中层**要在
+匹配前后各开一次间隙（两个游程，代价 `-2e20`），真实分差 `1e10`（该量级
+约 30 万个浮点 ULP），严格次优。旧实现在最优性比较中使用与分值成比例的
+相对容差 `1e-9`，其窗口在 2e20 量级被放大到 `2e11`，反而把中层的低分归属
+算进并列，`solution_count` / `solutions_listed` 都错误地变成 3，中层还混入
+主解与歧义区间。修复后容差改为 ULP 口径（`1e20` 量级一个 ULP 约 1.6e4，
+余量 4096 ULP ≈ 1.3e8，远小于 1e10 的真实分差），独立数据调用应得到
+**`dp_score=-1.9999999999e20`、恰好两个并列归属（首层 / 末层）**，中层只出
+现在未匹配侧，歧义区间只覆盖首、末两层：
+
+```bash
+docker compose up -d --build
+BASE=http://localhost:8000
+
+# 独立数据：参考孔三层、待校核孔一层（属性相同）
+curl -s -XPOST $BASE/api/boreholes -H 'Content-Type: application/json' -d '{
+  "name":"R","collar_elev":100,"x":0,"layers":[
+    {"top":0,"bottom":2,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9},
+    {"top":2,"bottom":4,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9},
+    {"top":4,"bottom":6,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9}]}' >/dev/null
+curl -s -XPOST $BASE/api/boreholes -H 'Content-Type: application/json' -d '{
+  "name":"H","collar_elev":100,"x":10,"layers":[
+    {"top":0,"bottom":2,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9}]}' >/dev/null
+
+# 五项权重全 0；open 与 extend 都取 1e20 量级但相差 1
+curl -s -XPUT $BASE/api/settings -H 'Content-Type: application/json' -d '{
+  "weights":{"lithology":0,"grain":0,"water":0,"elev":0,"confidence":0},
+  "gap_open":1e20,"gap_extend":9.999999999e19}' >/dev/null
+
+RID=$(curl -s $BASE/api/state | python3 -c 'import sys,json;print(next(b["id"] for b in json.load(sys.stdin)["boreholes"] if b["name"]=="R"))')
+# 不锁标志层：marker_ids 留空
+curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
+  -d "{\"reference_id\":$RID,\"marker_ids\":[]}" \
+| python3 -c 'import sys,json;h=json.load(sys.stdin)["holes"][0];print("dp_score =",h["dp_score"],"| solution_count =",h["solution_count"],"| solutions_listed =",h["solutions_listed"]);[print(s["pairs"],"unref",s["unmatched_ref"],"unhole",s["unmatched_hole"]) for s in h["tie_solutions"]];print("歧义参考层序号 =",[a["ref_seq"] for a in h["ambiguities"]])'
+# 期望：
+#   dp_score = -1.9999999999e+20 | solution_count = 2 | solutions_listed = 2
+#   [(<R1>, <H1>)] unref [<R2>, <R3>] unhole []
+#   [(<R3>, <H1>)] unref [<R1>, <R2>] unhole []
+#   歧义参考层序号 = [1, 3]      # 中层 R2 在任何最优路径上都只能未匹配
+# 「导出 JSON」(GET /api/export) 的 last_result 与上述口径一致。
+```
+
+同量级下**逐位相等的真正并列不受影响**：把上例改成参考孔两层、待校核孔
+一层并设 `gap_open=gap_extend=1e20`，匹配首层与匹配末层的代价同为
+`-1e20`，仍返回两个并列归属（见测试 `HugeGapPenaltyTest` 中的
+`test_genuine_tie_preserved_at_huge_scale` /
+`test_genuine_tie_preserved_huge_open_small_extend`）。
+
 ### 复现“低开间隙惩罚漏解”反例
 
 `PUT /api/settings` 允许任意**非负** `gap_open` / `gap_extend` 组合，包括
@@ -123,7 +178,10 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
   - 层间相似度 = 岩性 / 粒径 / 含水状态 / 高程接近度（指数衰减）/ 置信度五项加权；
   - 三态 DP（匹配态、参考孔间隙态、待校核孔间隙态）实现**仿射间隙代价**（开间隙 `gap_open`、续间隙 `gap_extend`），
     保持层序单调、允许尖灭/缺失/新增层；不可达哨兵为真正的负无穷，合法的负最优分
-    （如 `gap_open=1e20` 下的 `-1e20`）不会被误判为不可达；
+    （如 `gap_open=1e20` 下的 `-1e20`）不会被误判为不可达；最优性比较采用
+    ULP 尺度容差（小分值绝对容差 `1e-7` 兜底、大分值 4096 个浮点 ULP），
+    只吸收正/反表独立递推的舍入噪声，不会把“多开一次间隙”造成的 `1e10`
+    级真实分差误判为并列；
   - 总分按 `匹配相似度之和 / max(两孔层数) × 100` 归一化（`dp_score` 为未归一化的 DP 原始分）。
 - **输出**：相关层带（匹配对及五项相似度明细）、未匹配层（参考孔侧/待校核孔侧分列）、
   锚点对、总分与多孔平均分。
