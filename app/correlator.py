@@ -31,9 +31,14 @@
 接口只校验惩罚非负，取值可以任意大（如 1e20）：此时合法的最优分值本身
 可能是绝对值极大的负数（如 -1e20）。不可达哨兵必须严格小于任何可达
 分值，故使用真正的负无穷（不可达状态参与 max/加减时自然被淘汰，且不会
-被四舍五入进导出 JSON）；最优性比较使用随分值尺度缩放的容差，避免把
-“绝对值极大的合法负分”误判为不可达，也避免在大分值上按固定 1e-5 做
-等同比较时漏判本应并列的方案。
+被四舍五入进导出 JSON）；最优性比较使用按“分值所在处的 ULP（最小末位
+单位）+ 路径长度”缩放的容差，而不是固定的 1e-9 相对容差——分值在
+2e20 量级时一个 ULP 约 3.3e4，1e-9 相对容差却放大约 2e11，会把相差
+1e10（约 305 个 ULP）的严格次优归属（大间隙费下匹配中层须开两次间隙：
+-2e20，而匹配端层为 -1.9999999999e20）误并入并列。仿射间隙 DP 的每一
+次递推至多引入 1 个 ULP 舍入，一条长度 n+m 的路径累积不超过 n+m 个
+ULP，故容差取该量级：既吞掉“同一数学值经不同运算次序”的舍入、保留
+真正的并列，又不会让任何相差一个间隙代价的严格次优方案蒙混过关。
 """
 import math
 
@@ -42,19 +47,30 @@ from .domain import (
 )
 
 NEG = float("-inf")
-# 并列判定容差：固定绝对容差兜底小分值下的浮点舍入，相对容差覆盖大尺度
-# （1e20 量级时固定容差已无意义，该量级 ULP 约 1.6e4，故相对容差取 1e-9）。
+# 并列判定容差：固定绝对容差兜底小分值下的浮点舍入；相对部分按 ULP 计，
+# 再为每条路径预留 ULP_PAD 个 ULP 的余量（正表+反表、不同运算次序）。
 TOL_ABS = 1e-7
-TOL_REL = 1e-9
+ULP_PAD = 8
 MAX_SOLUTIONS = 100
 COUNT_CAP = 9999          # 并列解计数封顶，避免大整数
 
 
-def close(a, b, atol=TOL_ABS, rtol=TOL_REL):
-    """尺度感知的近似相等：不可达（-inf）只与 -inf 相等。"""
+def tie_tol(scale, steps=0):
+    """尺度 |scale|、路径长度 steps 下的并列容差。"""
+    return TOL_ABS + (steps + ULP_PAD) * math.ulp(abs(scale))
+
+
+def close(a, b, steps=0, tol=None):
+    """尺度感知的近似相等：不可达（-inf）只与 -inf 相等。
+
+    steps 为产生该分值的 DP 路径长度上限（段内 n+m、间隙区内 a+b）；
+    显式给出 tol 时直接使用（用于已按段尺度预算容差的场合）。
+    """
     if math.isinf(a) or math.isinf(b):
         return a == b
-    return abs(a - b) <= atol + rtol * max(abs(a), abs(b))
+    if tol is None:
+        tol = tie_tol(max(abs(a), abs(b)), steps)
+    return abs(a - b) <= tol
 
 
 def elevation_layer(layer, collar_elev):
@@ -146,23 +162,25 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
     if a == 0 and b == 0:
         return []
     _c, lH, lV = _gap_cost_table(gap_open, gap_extend, a, b)
-    steps = []
+    region_len = a + b
+    out = []
     x, y = a, b
     # 末态只在“该态真的可达”的候选中按分值选择（并列优先 H：同侧连跳、
     # 游程数最少）；不可达为 -inf，不可选到 x=0 的 H 或 y=0 的 V。
     h_ok, v_ok = math.isfinite(lH[x][y]), math.isfinite(lV[x][y])
     assert h_ok or v_ok, "间隙区终点不可达（不应出现：调用方只回溯最优区）"
-    state = "H" if h_ok and (not v_ok or lH[x][y] >= lV[x][y] - TOL_ABS) else "V"
+    end_tol = tie_tol(max(abs(lH[x][y]), abs(lV[x][y])), region_len)
+    state = "H" if h_ok and (not v_ok or lH[x][y] >= lV[x][y] - end_tol) else "V"
     while x > 0 or y > 0:
         if state == "H":
             cont = lH[x-1][y] - gap_extend
             switch = lV[x-1][y] - gap_open
             start = -gap_open if (x == 1 and y == 0) else NEG
             best = max(cont, switch, start)
-            steps.append(("GA", p + x, 0))
-            if math.isfinite(cont) and close(cont, best):
+            out.append(("GA", p + x, 0))
+            if math.isfinite(cont) and close(cont, best, steps=region_len):
                 state = "H"
-            elif math.isfinite(switch) and close(switch, best):
+            elif math.isfinite(switch) and close(switch, best, steps=region_len):
                 state = "V"
             else:
                 state = "D"
@@ -172,10 +190,10 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
             switch = lH[x][y-1] - gap_open
             start = -gap_open if (x == 0 and y == 1) else NEG
             best = max(cont, switch, start)
-            steps.append(("GB", 0, q + y))
-            if math.isfinite(cont) and close(cont, best):
+            out.append(("GB", 0, q + y))
+            if math.isfinite(cont) and close(cont, best, steps=region_len):
                 state = "V"
-            elif math.isfinite(switch) and close(switch, best):
+            elif math.isfinite(switch) and close(switch, best, steps=region_len):
                 state = "H"
             else:
                 state = "D"
@@ -183,8 +201,8 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
         if state == "D":
             # 首步已接回区域起点匹配态，必已到 (0,0)
             break
-    steps.reverse()
-    return steps
+    out.reverse()
+    return out
 
 # ---------------------------------------------------------------------------
 # 单段序列对齐（局部坐标：A = 参考孔层，B = 待校核孔层）
@@ -204,6 +222,7 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
     V：上一步为 B 出列（A 方向间隙，待校核层未匹配）。
     """
     n, m = len(A), len(B)
+    seg_steps = n + m
     D = [[NEG] * (m + 1) for _ in range(n + 1)]
     H = [[NEG] * (m + 1) for _ in range(n + 1)]
     V = [[NEG] * (m + 1) for _ in range(n + 1)]
@@ -283,9 +302,9 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
                     # best 初值 -inf：有限 val 恒严格优于 -inf
                     if not math.isfinite(best):
                         best, cnt = val, CD[p][q]
-                    elif val > best and not close(val, best):
+                    elif val > best and not close(val, best, steps=seg_steps):
                         best, cnt = val, CD[p][q]       # 严格更大：替换
-                    elif close(val, best):
+                    elif close(val, best, steps=seg_steps):
                         cnt = min(COUNT_CAP, cnt + CD[p][q])  # 容差内：并列
             FD[i][j], CD[i][j] = best, cnt
 
@@ -296,7 +315,7 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
             if not math.isfinite(FD[p][q]):
                 continue
             val = FD[p][q] + gcost[(n - p, m - q)]
-            if close(val, total):
+            if close(val, total, steps=seg_steps):
                 total_count = min(COUNT_CAP, total_count + CD[p][q])
 
     # ---- 判定每条匹配边 (i,j) 是否在某条最优路径上 ----
@@ -305,7 +324,8 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             pre = max(D[i-1][j-1], H[i-1][j-1], V[i-1][j-1])
-            on_path = close(pre + sim[(i, j)] + RD[i][j], total)
+            on_path = close(pre + sim[(i, j)] + RD[i][j], total,
+                            steps=seg_steps)
             if on_path:
                 match_edges[(i, j)] = True
                 match_partners[i].add(j)
@@ -323,12 +343,12 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
             )
             if not math.isfinite(best):
                 continue
-            if close(best + RH[i][j], total):
+            if close(best + RH[i][j], total, steps=seg_steps):
                 gap_positions[i].add(0)
 
     # ---- 主解回溯（偏好：间隙区尽量小 = 尽量多匹配）----
     primary = _build_primary_steps(
-        n, m, sim, FD, gcost, total, gap_open, gap_extend)
+        n, m, sim, FD, gcost, total, gap_open, gap_extend, seg_steps)
 
     return {
         "total": total,
@@ -337,6 +357,7 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
         "match_edges": match_edges,
         "match_partners": match_partners,
         "gap_positions": gap_positions,
+        "seg_steps": seg_steps,
         "D": D, "H": H, "V": V,
         "RD": RD, "RH": RH, "RV": RV,
         "FD": FD, "CD": CD, "gcost": gcost, "GH": GH, "GV": GV,
@@ -344,7 +365,7 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
 
 
 def _best_region_predecessor(i, j, FD, gcost, target, real_match,
-                             sim_score=0.0):
+                             sim_score, seg_steps):
     """节点 (i,j) 经最优间隙区后的最佳前驱匹配节点 (p,q)。
 
     target 为该节点要求达到的分值。real_match=True 表示 (i,j) 是真实
@@ -364,14 +385,14 @@ def _best_region_predecessor(i, j, FD, gcost, target, real_match,
             a = i - p - 1 if real_match else i - p
             b = j - q - 1 if real_match else j - q
             val = FD[p][q] + gcost[(a, b)] + (sim_score if real_match else 0.0)
-            if close(val, target):
+            if close(val, target, steps=seg_steps):
                 cands.append((p, q, a + b))
     cands.sort(key=lambda t: (t[2], -t[0], -t[1]))
     return cands[0][0], cands[0][1]
 
 
 def _build_primary_steps(n, m, sim, FD, gcost, total,
-                         gap_open, gap_extend):
+                         gap_open, gap_extend, seg_steps):
     """从段尾反向贪心选出主解，再展开为正向规范步骤。
 
     每个 block 记 (前驱(p,q), 当前(ci,cj), 当前是否真实匹配节点)。
@@ -385,19 +406,20 @@ def _build_primary_steps(n, m, sim, FD, gcost, total,
         return []
     # 段尾：优先“匹配到 (n,m)”收尾（真实匹配节点，real_match=True），
     # 否则以纯间隙收尾（虚节点，real_match=False）
-    match_end = math.isfinite(FD[i][j]) and close(FD[i][j], total)
+    match_end = math.isfinite(FD[i][j]) and \
+        close(FD[i][j], total, steps=seg_steps)
     if match_end:
         p, q = _best_region_predecessor(
-            i, j, FD, gcost, FD[i][j], True, sim[(i, j)])
+            i, j, FD, gcost, FD[i][j], True, sim[(i, j)], seg_steps)
     else:
         p, q = _best_region_predecessor(
-            i, j, FD, gcost, total, False)
+            i, j, FD, gcost, total, False, 0.0, seg_steps)
     blocks.append((p, q, i, j, match_end))
     i, j = p, q
     # 其余节点必为真实匹配节点
     while i > 0 or j > 0:
         p, q = _best_region_predecessor(
-            i, j, FD, gcost, FD[i][j], True, sim[(i, j)])
+            i, j, FD, gcost, FD[i][j], True, sim[(i, j)], seg_steps)
         blocks.append((p, q, i, j, True))
         i, j = p, q
     steps = []
@@ -429,6 +451,7 @@ def _enum_segment_paths(seg, limit=MAX_SOLUTIONS):
     FD = seg["FD"]
     gcost = seg["gcost"]
     go, ge = seg["gap_open"], seg["gap_extend"]
+    seg_steps = seg["seg_steps"]
     results = []
 
     def successors(i, j):
@@ -447,14 +470,15 @@ def _enum_segment_paths(seg, limit=MAX_SOLUTIONS):
             for nj in range(j + 1, m + 1):
                 a, b = ni - i - 1, nj - j - 1
                 base = prefix + gcost[(a, b)] + sim[(ni, nj)]
-                if close(base, FD[ni][nj]) and \
-                        close(FD[ni][nj] + seg["RD"][ni][nj], total):
+                if close(base, FD[ni][nj], steps=seg_steps) and \
+                        close(FD[ni][nj] + seg["RD"][ni][nj], total,
+                              steps=seg_steps):
                     region = _canonical_region(a, b, i, j, go, ge)
                     out.append((ni, nj, region + [("M", ni, nj)], True))
         # 段尾 (n,m) 纯间隙收尾：跳过 n-i / m-j 层，不产生匹配
         a, b = n - i, m - j
         if a > 0 or b > 0:
-            if close(prefix + gcost[(a, b)], total):
+            if close(prefix + gcost[(a, b)], total, steps=seg_steps):
                 region = _canonical_region(a, b, i, j, go, ge)
                 out.append((n, m, region, False))
         # 主解优先：匹配收尾在前；间隙区小（匹配多）在前；顺序确定

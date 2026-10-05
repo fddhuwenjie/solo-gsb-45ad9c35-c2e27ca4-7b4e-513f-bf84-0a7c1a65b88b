@@ -12,6 +12,13 @@
 正/反表被幻影值污染，POST /api/correlate 在规范回溯时 500。修复后哨兵
 为真正的负无穷、最优性比较按分值尺度缩放，详见 HugeGapPenaltyTest。
 
+第三个反例（大数值间隙费下的伪并列）：gap_open=1e20、
+gap_extend=9.999999999e19、参考孔三层、待校核孔一层时，匹配端层只开
+一次间隙（-1.9999999999e20），匹配中层要开两次（-2e20，相差 1e10、约
+305 个 ULP）。旧的固定 1e-9 相对容差在 2e20 量级放大约 2e11，把严格
+次优的中层归属误并入并列（solution_count=3）。修复后容差按“分值处
+ULP × 路径长度”缩放，详见 PseudoTieHugeGapTest。
+
 运行：python -m unittest discover -s tests -v
 """
 import unittest
@@ -385,6 +392,178 @@ class HugeGapPenaltyTest(unittest.TestCase):
         self.assertTrue(math.isfinite(res["dp_score"]))
 
 
+class PseudoTieHugeGapTest(unittest.TestCase):
+    """大数值间隙费下，差一个完整间隙代价的严格次优归属不得伪并列。
+
+    任务反例：参考孔三层、待校核孔一层，五项权重全 0，不锁标志层，
+    gap_open=1e20、gap_extend=9.999999999e19。待校核层匹配参考孔首层
+    或末层都只开一次间隙（一个游程 = open + extend），最优分值同为
+    -1.9999999999e20；匹配中层须在两侧各开一次间隙（两个游程），分值
+    -2e20，严格次优 1e10（2e20 处约 305 个 ULP）。旧实现的固定 1e-9
+    相对容差在该量级放大约 2e11，中层被误判并列：计数与列出均为 3、
+    中层还污染了正反向歧义判定。修复后容差按“分值处 ULP × 路径长度”
+    缩放（一条 n+m 的仿射间隙路径至多累积 n+m 个 ULP 舍入），中层不得
+    进入主解、tie_solutions 或歧义区间，计数与列出均为 2。
+    """
+
+    GO = 1e20
+    GE = 9.999999999e19
+    END_SCORE = -1.9999999999e20
+
+    def test_3x1_large_extend_only_endpoints_optimal(self):
+        """任务反例主用例：3 层对 1 层，中层严格次优 -> 恰好两个归属。"""
+        ref = make_layers([(101, "砂岩"), (102, "砂岩"), (103, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, self.GO, self.GE)
+        # 最优分值：一个游程 open+extend；两次游程为 -2e20，严格更差
+        self.assertEqual(res["dp_score"], self.END_SCORE)
+        self.assertEqual(res["solution_count"], 2)
+        self.assertEqual(res["solutions_listed"], 2)
+        self.assertEqual(signatures(res), {
+            (((101, 201),), (102, 103), ()),      # 匹配首层
+            (((103, 201),), (101, 102), ()),      # 匹配末层
+        })
+        # 中层不进入任何并列方案
+        for sol in res["tie_solutions"]:
+            self.assertNotIn((102, 201), sol["pairs"])
+            self.assertIn(102, sol["unmatched_ref"])
+        # 主解匹配首层或末层，且恰有两个未匹配参考层
+        primary = {(p["ref_layer_id"], p["hole_layer_id"])
+                   for p in res["pairs"]}
+        self.assertIn(primary, [{(101, 201)}, {(103, 201)}])
+        self.assertEqual(len(res["unmatched_ref"]), 2)
+        self.assertEqual(res["unmatched_hole"], [])
+        # 歧义区间只涉及首层、末层；中层在所有最优路径上恒为“未匹配”，
+        # 不产生歧义（不出现在 partners，也不算多结局）
+        amb = {a["ref_seq"]: a for a in res["ambiguities"]}
+        self.assertEqual(set(amb), {1, 3})
+        for seq in (1, 3):
+            self.assertTrue(amb[seq]["can_be_unmatched"])
+            self.assertEqual(amb[seq]["outcome_count"], 2)
+            self.assertEqual([x["seq"] for x in amb[seq]["partners"]], [1])
+        # 导出 JSON 合法、分值有限
+        import json
+        import math
+        self.assertTrue(math.isfinite(res["dp_score"]))
+        self.assertNotIn("NaN", json.dumps(res))
+
+    def test_4x1_large_extend_only_endpoints_optimal(self):
+        """4 参考层对 1 待校核层：只有首层/末层最优（匹配端层后同侧连跳，
+        一个游程 = open + 2·extend）。匹配第 2、3 层都要开两个游程
+        （约 -2.6e20，远差于端层），全部排除 -> 计数为 2，歧义区间也只
+        挂在首层、末层。"""
+        ref = make_layers([(101, "砂岩"), (102, "砂岩"),
+                           (103, "砂岩"), (104, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, self.GO, self.GE)
+        self.assertEqual(res["dp_score"], -(self.GO + 2 * self.GE))
+        self.assertEqual(res["solution_count"], 2)
+        self.assertEqual(res["solutions_listed"], 2)
+        self.assertEqual(signatures(res), {
+            (((101, 201),), (102, 103, 104), ()),
+            (((104, 201),), (101, 102, 103), ()),
+        })
+        self.assertEqual({a["ref_seq"] for a in res["ambiguities"]}, {1, 4})
+
+    def test_1x3_symmetric_only_endpoints_optimal(self):
+        """镜像情形 1 对 3：参考层匹配待校核首层/末层（各一个游程）最优，
+        匹配中层（两个游程）严格次优 -> 2 个归属。"""
+        ref = make_layers([(101, "砂岩")])
+        hole = make_layers([(201, "砂岩"), (202, "砂岩"), (203, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, self.GO, self.GE)
+        self.assertEqual(res["dp_score"], self.END_SCORE)
+        self.assertEqual(res["solution_count"], 2)
+        self.assertEqual(res["solutions_listed"], 2)
+        self.assertEqual(signatures(res), {
+            (((101, 201),), (), (202, 203)),
+            (((101, 203),), (), (201, 202)),
+        })
+        # 参考层的歧义候选只有首、末两个待校核层；它在每条最优路径上都
+        # 被匹配（整层未匹配要开三个游程），故不可未匹配、结局数为 2
+        amb = res["ambiguities"]
+        self.assertEqual(len(amb), 1)
+        self.assertEqual(sorted(x["seq"] for x in amb[0]["partners"]), [1, 3])
+        self.assertFalse(amb[0]["can_be_unmatched"])
+        self.assertEqual(amb[0]["outcome_count"], 2)
+
+    def test_equal_huge_open_extend_middle_is_genuine_tie(self):
+        """并列回归：open=extend=1e20 时匹配中层也是两个游程 -2e20，
+        与端层同分（恰为同一数学值），首/中/末三个归属真正并列，必须
+        全部保留——容差收紧不能误杀真正的并列。"""
+        ref = make_layers([(101, "砂岩"), (102, "砂岩"), (103, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 1e20, 1e20)
+        self.assertEqual(res["dp_score"], -2e20)
+        self.assertEqual(res["solution_count"], 3)
+        self.assertEqual(res["solutions_listed"], 3)
+        self.assertEqual(signatures(res), {
+            (((101, 201),), (102, 103), ()),
+            (((102, 201),), (101, 103), ()),
+            (((103, 201),), (101, 102), ()),
+        })
+        # 三个参考层都有“匹配唯一待校核层 / 未匹配”的歧义
+        self.assertEqual({a["ref_seq"] for a in res["ambiguities"]},
+                         {1, 2, 3})
+        for amb in res["ambiguities"]:
+            self.assertEqual(amb["outcome_count"], 2)
+            self.assertTrue(amb["can_be_unmatched"])
+
+    def test_one_ulp_advantage_still_treated_as_tie(self):
+        """端层比中层仅优 1 个 ULP（2e20 处 ULP=32768）：属舍入量级，
+        应判为真正并列（3 个归属），验证 ULP 容差不会过紧。"""
+        ge = 1e20 - 32768.0           # 端层恰比中层优 1 个 ULP
+        ref = make_layers([(101, "砂岩"), (102, "砂岩"), (103, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 1e20, ge)
+        self.assertEqual(res["solution_count"], 3)
+        self.assertEqual(res["solutions_listed"], 3)
+        self.assertEqual({tuple(s["pairs"]) for s in res["tie_solutions"]},
+                         {((101, 201),), ((102, 201),), ((103, 201),)})
+
+    def test_fifty_ulp_advantage_is_strict(self):
+        """端层比中层优 50 个 ULP：超出路径长度内的舍入累积，严格次优
+        的中层被排除（2 个归属）。"""
+        ge = 1e20 - 50 * 32768.0
+        ref = make_layers([(101, "砂岩"), (102, "砂岩"), (103, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 1e20, ge)
+        self.assertEqual(res["solution_count"], 2)
+        self.assertEqual(res["solutions_listed"], 2)
+        self.assertEqual(signatures(res), {
+            (((101, 201),), (102, 103), ()),
+            (((103, 201),), (101, 102), ()),
+        })
+
+    def test_nonnegative_penalty_small_scale_unaffected(self):
+        """常规小尺度下既有行为不变：正惩罚 2/1 仅全匹配最优；全零 6 并列。"""
+        ref = make_layers([(101, "砂岩"), (102, "砂岩")])
+        hole = make_layers([(201, "砂岩"), (202, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 2.0, 1.0)
+        self.assertEqual(res["solution_count"], 1)
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 0.0, 0.0)
+        self.assertEqual(res["solution_count"], 6)
+
+    def test_locked_marker_segments_consistent_at_huge_values(self):
+        """锁定标志层在大数值下仍为强制锚点：锚点中层锁定 -> 两段 1x1，
+        每段匹配（0 分）严格优于未匹配（一次游程），组合后仅 1 个归属。"""
+        ref = make_layers([(101, "砂岩"), (102, "煤层"), (103, "砂岩")])
+        hole = make_layers([(201, "砂岩"), (202, "煤层"), (203, "砂岩")])
+        res = correlate(ref, hole, [(1, 1)], ZERO_WEIGHTS, 5.0,
+                        self.GO, self.GE)
+        self.assertEqual(res["dp_score"], 0.0)
+        self.assertEqual(res["solution_count"], 1)
+        self.assertEqual(res["solutions_listed"], 1)
+        self.assertEqual(
+            [(p["ref_layer_id"], p["hole_layer_id"]) for p in res["pairs"]],
+            [(101, 201), (102, 202), (103, 203)])
+        # 锚点强制出现且不计未匹配
+        self.assertEqual([(a["ref_seq"], a["hole_seq"])
+                          for a in res["anchors"]], [(2, 2)])
+        self.assertEqual(res["unmatched_ref"], [])
+        self.assertEqual(res["unmatched_hole"], [])
+        self.assertEqual(res["ambiguities"], [])
+
+
 class HttpHugeGapPenaltyTest(unittest.TestCase):
     """端到端：PUT /api/settings 接受 1e20 后 POST /api/correlate 不报 500。
 
@@ -455,6 +634,53 @@ class HttpHugeGapPenaltyTest(unittest.TestCase):
         self.assertEqual(eh["dp_score"], -1e20)
         self.assertEqual(eh["solution_count"], 2)
         self.assertEqual(eh["solutions_listed"], 2)
+
+    def test_settings_huge_open_large_extend_no_pseudo_tie(self):
+        """任务反例端到端：参考孔三层、待校核孔一层，gap_open=1e20、
+        gap_extend=9.999999999e19，中层（须开两次间隙）不得伪并列。"""
+        rid = self._hole("R", 3)
+        hid = self._hole("H", 1)
+        resp = self.client.put("/api/settings", json={
+            "weights": {"lithology": 0, "grain": 0, "water": 0,
+                        "elev": 0, "confidence": 0},
+            "gap_open": 1e20, "gap_extend": 9.999999999e19})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.get_json()["gap_extend"], 9.999999999e19)
+        resp = self.client.post("/api/correlate",
+                                json={"reference_id": rid, "marker_ids": []})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        h = next(x for x in resp.get_json()["holes"]
+                 if x["hole_id"] == hid)
+        # tie_solutions.pairs 携带层 id：建立参考孔 id -> seq 映射
+        ref_info = self.client.get("/api/state").get_json()
+        ref_bh = next(b for b in ref_info["boreholes"] if b["id"] == rid)
+        id_to_seq = {ly["id"]: ly["seq"] for ly in ref_bh["layers"]}
+        # 最优：匹配首层或末层，各开一个游程；中层 -2e20 严格次优
+        self.assertEqual(h["dp_score"], -1.9999999999e20)
+        self.assertEqual(h["solution_count"], 2)
+        self.assertEqual(h["solutions_listed"], 2)
+        # 中层（参考孔 seq=2）不在任何方案的匹配对中
+        for sol in h["tie_solutions"]:
+            ref_seqs = {id_to_seq[p[0]] for p in sol["pairs"]}
+            self.assertTrue(ref_seqs <= {1, 3})
+            self.assertEqual(len(sol["pairs"]), 1)
+        # 主解只匹配首层或末层
+        self.assertEqual(len(h["pairs"]), 1)
+        self.assertIn(h["pairs"][0]["ref_seq"], (1, 3))
+        self.assertEqual(len(h["unmatched_ref"]), 2)
+        # 歧义区间只挂首层、末层；中层恒未匹配，无歧义
+        self.assertEqual(sorted(a["ref_seq"] for a in h["ambiguities"]), [1, 3])
+        # 导出归档口径与重算一致
+        resp = self.client.get("/api/export")
+        self.assertEqual(resp.status_code, 200)
+        import json
+        exported = json.loads(resp.data)
+        eh = next(x for x in exported["last_result"]["holes"]
+                  if x["hole_id"] == hid)
+        self.assertEqual(eh["dp_score"], -1.9999999999e20)
+        self.assertEqual(eh["solution_count"], 2)
+        self.assertEqual(eh["solutions_listed"], 2)
+        self.assertEqual(sorted(a["ref_seq"] for a in eh["ambiguities"]), [1, 3])
 
 
 if __name__ == "__main__":
